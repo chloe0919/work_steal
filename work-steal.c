@@ -17,6 +17,8 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
 
 struct work_internal;
 
@@ -53,6 +55,11 @@ typedef struct {
   atomic_size_t size;
   _Atomic work_t *buffer[];
 } array_t;
+
+typedef struct {
+    int *tid;
+    work_t *dw;
+} ThreadArgs;
 
 typedef struct {
   /* Assume that they never overflow */
@@ -105,7 +112,7 @@ work_t *take(deque_t *q) {
   work_t *x;
   if (t <= b) {
     /* Non-empty queue */
-    x = atomic_load_explicit(&a->buffer[b % a->size], memory_order_relaxed);
+    x = (work_t *)atomic_load_explicit(&a->buffer[b % a->size], memory_order_relaxed);
     if (t == b) {
       /* Single last element in queue */
       if (!atomic_compare_exchange_strong_explicit(
@@ -129,7 +136,7 @@ void push(deque_t *q, work_t *w) {
     resize(q);
     a = atomic_load_explicit(&q->array, memory_order_relaxed);
   }
-  atomic_store_explicit(&a->buffer[b % a->size], w, memory_order_relaxed);
+  atomic_store_explicit(&a->buffer[b % a->size], (_Atomic work_t *)w, memory_order_relaxed);
   atomic_thread_fence(memory_order_release);
   atomic_store_explicit(&q->bottom, b + 1, memory_order_relaxed);
 }
@@ -142,7 +149,7 @@ work_t *steal(deque_t *q) {
   if (t < b) {
     /* Non-empty queue */
     array_t *a = atomic_load_explicit(&q->array, memory_order_consume);
-    x = atomic_load_explicit(&a->buffer[t % a->size], memory_order_relaxed);
+    x = (work_t *)atomic_load_explicit(&a->buffer[t % a->size], memory_order_relaxed);
     if (!atomic_compare_exchange_strong_explicit(
             &q->top, &t, t + 1, memory_order_seq_cst, memory_order_relaxed))
       /* Failed race */
@@ -151,7 +158,8 @@ work_t *steal(deque_t *q) {
   return x;
 }
 
-#define N_THREADS 24
+// #define N_THREADS 24
+int N_THREADS = 24;
 deque_t *thread_queues;
 
 atomic_bool done;
@@ -178,9 +186,26 @@ work_t *join_work(work_t *work) {
     return work;
   return NULL;
 }
+work_t *print_task(work_t *w) {
+  int *payload = (int *)w->args[0];
+  int item = *payload;
+  printf("Did item %p with payload %d\n", w, item);
+  work_t *cont = (work_t *)w->args[1];
+  free(payload);
+  free(w);
+  return join_work(cont);
+}
 
-void *thread(void *payload) {
-  int id = *(int *)payload;
+work_t *done_task(work_t *w) {
+  free(w);
+  atomic_store(&done, true);
+  return NULL;
+}
+
+
+void *thread(void *arg) {
+  ThreadArgs *p = (ThreadArgs *)arg;
+  int id = *(p->tid);
   deque_t *my_queue = &thread_queues[id];
   while (true) {
     work_t *work = take(my_queue);
@@ -223,67 +248,78 @@ void *thread(void *payload) {
   return NULL;
 }
 
-work_t *print_task(work_t *w) {
-  int *payload = (int *)w->args[0];
-  int item = *payload;
-  printf("Did item %p with payload %d\n", w, item);
-  work_t *cont = (work_t *)w->args[1];
-  free(payload);
-  free(w);
-  return join_work(cont);
-}
+void dofunction(){
+    /* Check that top and bottom are 64-bit so they never overflow */
+    static_assert(sizeof(atomic_size_t) == 8,
+                  "Assume atomic_size_t is 8 byte wide");
 
-work_t *done_task(work_t *w) {
-  free(w);
-  atomic_store(&done, true);
-  return NULL;
-}
+    pthread_t threads[N_THREADS];
+    int tids[N_THREADS];
+    ThreadArgs args[N_THREADS];
+    thread_queues = malloc(N_THREADS * sizeof(deque_t));
+    int nprints = 8;
 
+    atomic_store(&done, false);
+    work_t *done_work = malloc(sizeof(work_t));
+    done_work->code = &done_task;
+    done_work->join_count = N_THREADS * nprints;
+
+    for (int i = 0; i < N_THREADS; ++i) {
+      tids[i] = i;
+      init(&thread_queues[i], 8);
+      for (int j = 0; j < nprints; ++j) {
+        work_t *work = malloc(sizeof(work_t) + 2 * sizeof(int *));
+        work->code = &print_task;
+        work->join_count = 0;
+        int *payload = malloc(sizeof(int));
+        *payload = 1000 * i + j;
+        work->args[0] = payload;
+        work->args[1] = done_work;
+        push(&thread_queues[i], work);
+      }
+    }
+    clock_t start, end;
+    start = clock();
+    
+    for (int i = 0; i < N_THREADS; ++i) {
+      args[i].tid = &tids[i];
+      args[i].dw = done_work;
+      if (pthread_create(&threads[i], NULL, thread, (void *)&args[i]) != 0) {
+        perror("Failed to start the thread");
+        exit(EXIT_FAILURE);
+      }
+    }
+
+    for (int i = 0; i < N_THREADS; ++i) {
+      if (pthread_join(threads[i], NULL) != 0) {
+        perror("Failed to join the thread");
+        exit(EXIT_FAILURE);
+      }
+    }
+    printf("Expect %d lines of output (including this one)\n",
+           2 * N_THREADS * nprints + N_THREADS + 2);
+
+
+    end = clock();
+    double  time = ((double) (end-start)) / CLOCKS_PER_SEC;
+    // FILE *fp = fopen("steal.csv", "a");
+    printf("Elapsed time: %.2f seconds\n", time);
+
+    for (int i = 0; i < N_THREADS; ++i){
+      array_t *array = atomic_load_explicit(&thread_queues[i].array, memory_order_relaxed);
+      free(array);
+    }
+    free(thread_queues);
+    
+    // fprintf(fp, "%d %.2f\n", N_THREADS, time);
+    // fclose(fp);
+}
 int main(int argc, char **argv) {
-  /* Check that top and bottom are 64-bit so they never overflow */
-  static_assert(sizeof(atomic_size_t) == 8,
-                "Assume atomic_size_t is 8 byte wide");
-
-  pthread_t threads[N_THREADS];
-  int tids[N_THREADS];
-  thread_queues = malloc(N_THREADS * sizeof(deque_t));
-  int nprints = 10;
-
-  atomic_store(&done, false);
-  work_t *done_work = malloc(sizeof(work_t));
-  done_work->code = &done_task;
-  done_work->join_count = N_THREADS * nprints;
-
-  for (int i = 0; i < N_THREADS; ++i) {
-    tids[i] = i;
-    init(&thread_queues[i], 8);
-    for (int j = 0; j < nprints; ++j) {
-      work_t *work = malloc(sizeof(work_t) + 2 * sizeof(int *));
-      work->code = &print_task;
-      work->join_count = 0;
-      int *payload = malloc(sizeof(int));
-      *payload = 1000 * i + j;
-      work->args[0] = payload;
-      work->args[1] = done_work;
-      push(&thread_queues[i], work);
-    }
-  }
-
-  for (int i = 0; i < N_THREADS; ++i) {
-    if (pthread_create(&threads[i], NULL, thread, &tids[i]) != 0) {
-      perror("Failed to start the thread");
-      exit(EXIT_FAILURE);
-    }
-  }
-
-  for (int i = 0; i < N_THREADS; ++i) {
-    if (pthread_join(threads[i], NULL) != 0) {
-      perror("Failed to join the thread");
-      exit(EXIT_FAILURE);
-    }
-  }
-  printf("Expect %d lines of output (including this one)\n",
-         2 * N_THREADS * nprints + N_THREADS + 2);
-
+  // FILE *fp = fopen("steal.csv", "w");
+  // fprintf(fp, "count time\n");
+  // fclose(fp);
+  // for (N_THREADS = 4; N_THREADS <= 4; N_THREADS++) {
+  dofunction();
+  // }
   return 0;
 }
