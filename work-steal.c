@@ -10,7 +10,7 @@
  * the essential idea of work stealing mentioned in Leiserson and Platt,
  * Programming Parallel Applications in Cilk
  */
-
+#define _POSIX_C_SOURCE 199309L
 #include <assert.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -44,6 +44,11 @@ typedef struct work_internal {
   void *args[];
 } work_t;
 
+typedef struct {
+    int *tid;
+    work_t *dw;
+} ThreadArgs;
+
 /* These are non-NULL pointers that will result in page faults under normal
  * circumstances, used to verify that nobody uses non-initialized entries.
  */
@@ -53,13 +58,9 @@ static work_t *EMPTY = (work_t *)0x100, *ABORT = (work_t *)0x200;
 
 typedef struct {
   atomic_size_t size;
+  atomic_size_t ref_count;
   _Atomic work_t *buffer[];
 } array_t;
-
-typedef struct {
-    int *tid;
-    work_t *dw;
-} ThreadArgs;
 
 typedef struct {
   /* Assume that they never overflow */
@@ -67,26 +68,48 @@ typedef struct {
   _Atomic(array_t *) array;
 } deque_t;
 
+void release_array(array_t *a) {
+    if (a != NULL && atomic_fetch_sub(&a->ref_count, 1) == 1) {
+        // printf("release %p, count %ld\n", a, a->ref_count);
+        free(a);
+    }
+}
+
+void refcountadd(array_t *a) {
+    if (a != NULL) {
+        atomic_fetch_add(&a->ref_count, 1);
+    }
+}
+
+void refcountsub(array_t *a) {
+    if (a != NULL) {
+        atomic_fetch_sub(&a->ref_count, 1);
+    }
+}
+
 void init(deque_t *q, int size_hint) {
   atomic_init(&q->top, 0);
   atomic_init(&q->bottom, 0);
   array_t *a = malloc(sizeof(array_t) + sizeof(work_t *) * size_hint);
   atomic_init(&a->size, size_hint);
   atomic_init(&q->array, a);
+  atomic_init(&a->ref_count, 1);
 }
 
 void resize(deque_t *q) {
+  printf("resize\n");
   array_t *a = atomic_load_explicit(&q->array, memory_order_relaxed);
   size_t old_size = a->size;
   size_t new_size = old_size * 2;
   array_t *new = malloc(sizeof(array_t) + sizeof(work_t *) * new_size);
   atomic_init(&new->size, new_size);
+  atomic_init(&new->ref_count, 1);
   size_t t = atomic_load_explicit(&q->top, memory_order_relaxed);
   size_t b = atomic_load_explicit(&q->bottom, memory_order_relaxed);
-  for (size_t i = t; i < b; i++)
+  for (size_t i = t; i <= b; i++)
     new->buffer[i % new_size] = a->buffer[i % old_size];
-
   atomic_store_explicit(&q->array, new, memory_order_relaxed);
+  release_array(a);
   /* The question arises as to the appropriate timing for releasing memory
    * associated with the previous array denoted by *a. In the original Chase
    * and Lev paper, this task was undertaken by the garbage collector, which
@@ -112,7 +135,8 @@ work_t *take(deque_t *q) {
   work_t *x;
   if (t <= b) {
     /* Non-empty queue */
-    x = (work_t *)atomic_load_explicit(&a->buffer[b % a->size], memory_order_relaxed);
+    x = (work_t *)atomic_load_explicit(&a->buffer[b % a->size],
+                                       memory_order_relaxed);
     if (t == b) {
       /* Single last element in queue */
       if (!atomic_compare_exchange_strong_explicit(
@@ -132,11 +156,12 @@ void push(deque_t *q, work_t *w) {
   size_t b = atomic_load_explicit(&q->bottom, memory_order_relaxed);
   size_t t = atomic_load_explicit(&q->top, memory_order_acquire);
   array_t *a = atomic_load_explicit(&q->array, memory_order_relaxed);
-  if (b - t > a->size - 1) { /* Full queue */
+  if (b - t > a->size - 1) { /* Full queue */  
     resize(q);
     a = atomic_load_explicit(&q->array, memory_order_relaxed);
   }
-  atomic_store_explicit(&a->buffer[b % a->size], (_Atomic work_t *)w, memory_order_relaxed);
+  atomic_store_explicit(&a->buffer[b % a->size], (_Atomic work_t *)w,
+                        memory_order_relaxed);
   atomic_thread_fence(memory_order_release);
   atomic_store_explicit(&q->bottom, b + 1, memory_order_relaxed);
 }
@@ -149,26 +174,31 @@ work_t *steal(deque_t *q) {
   if (t < b) {
     /* Non-empty queue */
     array_t *a = atomic_load_explicit(&q->array, memory_order_consume);
-    x = (work_t *)atomic_load_explicit(&a->buffer[t % a->size], memory_order_relaxed);
+    refcountadd(a);
+    x = (work_t *)atomic_load_explicit(&a->buffer[t % a->size],
+                                       memory_order_relaxed);
+    
     if (!atomic_compare_exchange_strong_explicit(
-            &q->top, &t, t + 1, memory_order_seq_cst, memory_order_relaxed))
+            &q->top, &t, t + 1, memory_order_seq_cst, memory_order_relaxed)){
+      refcountsub(a);
       /* Failed race */
-      return ABORT;
+      return ABORT;   
+    }
+    refcountsub(a);         
   }
   return x;
 }
 
-// #define N_THREADS 24
-int N_THREADS = 24;
+int N_THREADS = 2;
 deque_t *thread_queues;
 
-atomic_bool done;
+atomic_bool done; 
 
 /* Returns the subsequent item available for processing, or NULL if no items
  * are remaining.
  */
 static work_t *do_one_work(int id, work_t *work) {
-  printf("work item %d running item %p\n", id, work);
+  // printf("work item %d running item %p\n", id, work);
   return (*(work->code))(work);
 }
 
@@ -186,6 +216,8 @@ work_t *join_work(work_t *work) {
     return work;
   return NULL;
 }
+
+
 work_t *print_task(work_t *w) {
   int *payload = (int *)w->args[0];
   int item = *payload;
@@ -201,50 +233,76 @@ work_t *done_task(work_t *w) {
   atomic_store(&done, true);
   return NULL;
 }
-
-
 void *thread(void *arg) {
   ThreadArgs *p = (ThreadArgs *)arg;
   int id = *(p->tid);
+  // int id = *(int *) payload;
+    
+  deque_t *my_queue = &thread_queues[id];
+
+  ////// Add one work //////////////////////////////
+  work_t *newwork = malloc(sizeof(work_t) + 2 * sizeof(int *));
+  newwork->code = &print_task;
+  newwork->join_count = 0;
+  int *new_payload = malloc(sizeof(int));
+  *new_payload = 1000 * id + 8; 
+  newwork->args[0] = new_payload;
+  newwork->args[1] = p->dw; 
+  push(&thread_queues[id], newwork);
+  ////////////////////////////////////////////////////
+  while (true) {
+    work_t *work = take(my_queue);
+    if (work != EMPTY) {
+        do_work(id, work);
+    } else {
+        /* Currently, there is no work present in my own queue */
+        work_t *stolen = EMPTY;
+        for (int i = 0; i < N_THREADS; ++i) {
+            if (i == id)
+                continue;
+            stolen = steal(&thread_queues[i]);
+            if (stolen == ABORT) {
+                i--;
+                continue; /* Try again at the same i */
+            } else if (stolen == EMPTY)
+                continue;
+
+            /* Found some work to do */
+            break;
+        }
+        if (stolen == EMPTY) {
+            /* Despite the previous observation of all queues being devoid
+              * of tasks during the last examination, there exists
+              * a possibility that additional work items have been introduced
+              * subsequently. To account for this scenario, a state of active
+              * waiting is adopted, wherein the program continues to loop
+              * until the global "done" flag becomes set, indicative of
+              * potential new work additions.
+              */
+            if (atomic_load(&done))
+                break;
+            continue;
+        } else {
+            do_work(id, stolen);
+        }
+    }
+  }
+  printf("work item %d finished\n", id);
+  return NULL;
+}
+void *thread_nosteal(void *payload) {
+  int id = *(int *)payload;
   deque_t *my_queue = &thread_queues[id];
   while (true) {
     work_t *work = take(my_queue);
     if (work != EMPTY) {
       do_work(id, work);
     } else {
-      /* Currently, there is no work present in my own queue */
-      work_t *stolen = EMPTY;
-      for (int i = 0; i < N_THREADS; ++i) {
-        if (i == id)
-          continue;
-        stolen = steal(&thread_queues[i]);
-        if (stolen == ABORT) {
-          i--;
-          continue; /* Try again at the same i */
-        } else if (stolen == EMPTY)
-          continue;
-
-        /* Found some work to do */
+      if (atomic_load(&done))
         break;
-      }
-      if (stolen == EMPTY) {
-        /* Despite the previous observation of all queues being devoid
-         * of tasks during the last examination, there exists
-         * a possibility that additional work items have been introduced
-         * subsequently. To account for this scenario, a state of active
-         * waiting is adopted, wherein the program continues to loop
-         * until the global "done" flag becomes set, indicative of
-         * potential new work additions.
-         */
-        if (atomic_load(&done))
-          break;
-        continue;
-      } else {
-        do_work(id, stolen);
-      }
     }
   }
-  printf("work item %d finished\n", id);
+  printf("Thread %d finished\n", id);
   return NULL;
 }
 
@@ -262,7 +320,7 @@ void dofunction(){
     atomic_store(&done, false);
     work_t *done_work = malloc(sizeof(work_t));
     done_work->code = &done_task;
-    done_work->join_count = N_THREADS * nprints;
+    done_work->join_count = N_THREADS * (nprints+1);
 
     for (int i = 0; i < N_THREADS; ++i) {
       tids[i] = i;
