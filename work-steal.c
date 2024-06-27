@@ -189,7 +189,7 @@ work_t *steal(deque_t *q) {
   return x;
 }
 
-int N_THREADS = 2;
+int N_THREADS = 24;
 deque_t *thread_queues;
 
 atomic_bool done; 
@@ -241,14 +241,14 @@ void *thread(void *arg) {
   deque_t *my_queue = &thread_queues[id];
 
   ////// Add one work //////////////////////////////
-  work_t *newwork = malloc(sizeof(work_t) + 2 * sizeof(int *));
-  newwork->code = &print_task;
-  newwork->join_count = 0;
-  int *new_payload = malloc(sizeof(int));
-  *new_payload = 1000 * id + 8; 
-  newwork->args[0] = new_payload;
-  newwork->args[1] = p->dw; 
-  push(&thread_queues[id], newwork);
+  // work_t *newwork = malloc(sizeof(work_t) + 2 * sizeof(int *));
+  // newwork->code = &print_task;
+  // newwork->join_count = 0;
+  // int *new_payload = malloc(sizeof(int));
+  // *new_payload = 1000 * id + 8; 
+  // newwork->args[0] = new_payload;
+  // newwork->args[1] = p->dw; 
+  // push(&thread_queues[id], newwork);
   ////////////////////////////////////////////////////
   while (true) {
     work_t *work = take(my_queue);
@@ -257,19 +257,42 @@ void *thread(void *arg) {
     } else {
         /* Currently, there is no work present in my own queue */
         work_t *stolen = EMPTY;
-        for (int i = 0; i < N_THREADS; ++i) {
-            if (i == id)
-                continue;
+        /////////////////////////////////////////////////
+        int go = rand() % N_THREADS;
+        // printf("select %d\n",go);
+        int i = go;
+        do{
+            if (i == id){
+              i = (i + 1) % N_THREADS;
+              continue;
+            }
             stolen = steal(&thread_queues[i]);
             if (stolen == ABORT) {
-                i--;
                 continue; /* Try again at the same i */
-            } else if (stolen == EMPTY)
-                continue;
+            } else if (stolen == EMPTY){
+              i = (i + 1) % N_THREADS;
+              continue;
+            }
 
             /* Found some work to do */
             break;
-        }
+
+            i = (i + 1) % N_THREADS;
+
+        } while (i != go);
+        // for (int i = 0; i < N_THREADS; ++i) {
+        //     if (i == id)
+        //         continue;
+        //     stolen = steal(&thread_queues[i]);
+        //     if (stolen == ABORT) {
+        //         i--;
+        //         continue; /* Try again at the same i */
+        //     } else if (stolen == EMPTY)
+        //         continue;
+
+        //     /* Found some work to do */
+        //     break;
+        // }
         if (stolen == EMPTY) {
             /* Despite the previous observation of all queues being devoid
               * of tasks during the last examination, there exists
@@ -315,12 +338,12 @@ void dofunction(){
     int tids[N_THREADS];
     ThreadArgs args[N_THREADS];
     thread_queues = malloc(N_THREADS * sizeof(deque_t));
-    int nprints = 8;
+    int nprints = 10;
 
     atomic_store(&done, false);
     work_t *done_work = malloc(sizeof(work_t));
     done_work->code = &done_task;
-    done_work->join_count = N_THREADS * (nprints+1);
+    done_work->join_count = N_THREADS * nprints;
 
     for (int i = 0; i < N_THREADS; ++i) {
       tids[i] = i;
@@ -360,7 +383,7 @@ void dofunction(){
 
     end = clock();
     double  time = ((double) (end-start)) / CLOCKS_PER_SEC;
-    // FILE *fp = fopen("steal.csv", "a");
+    // FILE *fp = fopen("random_seq.csv", "a");
     printf("Elapsed time: %.2f seconds\n", time);
 
     for (int i = 0; i < N_THREADS; ++i){
@@ -373,11 +396,8 @@ void dofunction(){
     // fclose(fp);
 }
 int main(int argc, char **argv) {
-  // FILE *fp = fopen("steal.csv", "w");
-  // fprintf(fp, "count time\n");
-  // fclose(fp);
-  // for (N_THREADS = 4; N_THREADS <= 4; N_THREADS++) {
-  dofunction();
-  // }
+  for (N_THREADS = 24; N_THREADS <= 24; N_THREADS+=10) {
+    dofunction();
+  }
   return 0;
 }
